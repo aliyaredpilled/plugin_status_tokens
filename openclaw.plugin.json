@@ -1,0 +1,11 @@
+{
+  "id": "context-meter",
+  "name": "Context Meter",
+  "description": "Appends 📊 Xk/200k (Y%) context usage footer to every outbound AI reply",
+  "version": "1.0.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

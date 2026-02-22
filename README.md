@@ -15,16 +15,18 @@ Automatically sends a context usage footer after every AI reply in Telegram:
 
 ## Supported models
 
-| Model family | Context window |
+| Model family | Context window (fallback) |
 |---|---|
 | Claude | 200k |
-| Gemini | 1M |
+| Gemini | 1M (Gemini 1.5 Pro is 2M — add to config for exact value) |
 | MiniMax | 200k (or from config) |
-| GPT-4 | 128k |
+| GPT-4 / GPT-4o | 128k |
 
 Custom models: add `contextWindow` to your provider config in `openclaw.json` and it will be picked up automatically.
 
 ## Installation
+
+> Full install guide with all options: [INSTALL.md](INSTALL.md)
 
 **1. Copy files:**
 

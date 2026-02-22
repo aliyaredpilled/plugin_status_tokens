@@ -59,6 +59,9 @@ function getUsage(sessionId: string) {
 export default function register(api: OpenClawPluginApi) {
   api.on("agent_end", async (_evt: any, ctx: any) => {
     try {
+      // Skip if the response was interrupted/cancelled by the user
+      if (_evt?.success === false) return;
+
       const sessionKey = ctx?.sessionKey as string | undefined;
       const sessionId  = ctx?.sessionId  as string | undefined;
       api.logger.info(`[context-meter] agent_end sk=${sessionKey?.slice(-20)} sid=${sessionId?.slice(0,8)}`);

@@ -76,9 +76,11 @@ export default function register(api: OpenClawPluginApi) {
 
       const sessions: Record<string, any> = JSON.parse(readFileSync(sessionsFile, "utf8"));
       const origin = sessions[sessionKey]?.origin;
-      if (!origin?.from?.startsWith("telegram:")) return;
+      if (origin?.provider !== "telegram") return;
 
-      const chatId = origin.from.replace("telegram:", "");
+      // origin.to is always "telegram:<chatId>" (e.g. "telegram:-5170072400" for groups)
+      // origin.from for groups is "telegram:group:-5170072400" — wrong format for API
+      const chatId = (origin.to as string)?.replace("telegram:", "");
       const token  = (api.config as any)?.channels?.telegram?.botToken;
       if (!token) return;
 

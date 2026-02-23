@@ -64,7 +64,6 @@ export default function register(api: OpenClawPluginApi) {
 
       const sessionKey = ctx?.sessionKey as string | undefined;
       const sessionId  = ctx?.sessionId  as string | undefined;
-      api.logger.info(`[context-meter] agent_end sk=${sessionKey?.slice(-20)} sid=${sessionId?.slice(0,8)}`);
       if (!sessionKey || !sessionId) return;
 
       const usage = getUsage(sessionId);
@@ -78,7 +77,7 @@ export default function register(api: OpenClawPluginApi) {
       const origin = sessions[sessionKey]?.origin;
       if (origin?.provider !== "telegram") return;
 
-      // origin.to is always "telegram:<chatId>" (e.g. "telegram:-5170072400" for groups)
+      // origin.to is always "telegram:<chatId>" (works for both direct and group chats)
       // origin.from for groups is "telegram:group:-5170072400" — wrong format for API
       const chatId = (origin.to as string)?.replace("telegram:", "");
       const token  = (api.config as any)?.channels?.telegram?.botToken;

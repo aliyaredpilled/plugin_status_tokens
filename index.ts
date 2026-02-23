@@ -23,15 +23,46 @@ function readTail(filePath: string, maxBytes = 32_768): string {
   return buf.toString("utf8");
 }
 
+function normalizeModelId(v: string): string {
+  return String(v || "").toLowerCase().trim();
+}
+
+function stripProviderPrefix(v: string): string {
+  const s = normalizeModelId(v);
+  const i = s.indexOf("/");
+  return i >= 0 ? s.slice(i + 1) : s;
+}
+
 function getContextWindow(model: string, cfg: any): number {
   try {
+    const modelFull = normalizeModelId(model);
+    const modelBase = stripProviderPrefix(model);
+
     for (const p of Object.values((cfg?.models?.providers ?? {}) as any)) {
       for (const m of (p as any)?.models ?? []) {
-        if (m.id && model.includes(m.id) && m.contextWindow) return m.contextWindow;
+        if (!m?.id || !m?.contextWindow) continue;
+
+        const idFull = normalizeModelId(m.id);
+        const idBase = stripProviderPrefix(m.id);
+
+        // Support both forms:
+        // - runtime: "gpt-5.3-codex"
+        // - config : "openai-codex/gpt-5.3-codex"
+        if (
+          modelFull === idFull ||
+          modelBase === idBase ||
+          modelFull.includes(idFull) ||
+          idFull.includes(modelFull) ||
+          modelBase.includes(idBase) ||
+          idBase.includes(modelBase)
+        ) {
+          return m.contextWindow;
+        }
       }
     }
   } catch {}
-  const low = model.toLowerCase();
+
+  const low = normalizeModelId(model);
   for (const [k, v] of Object.entries(CONTEXT_DEFAULTS)) {
     if (low.includes(k)) return v;
   }
@@ -48,7 +79,7 @@ function getUsage(sessionId: string) {
       try {
         const e = JSON.parse(line);
         if (e?.message?.role === "assistant" && e.message.usage?.totalTokens) {
-          return { totalTokens: e.message.usage.totalTokens, model: e.message.model ?? "claude" };
+          return { totalTokens: e.message.usage.totalTokens, model: e.message.model as string | undefined };
         }
       } catch {}
     }
@@ -83,7 +114,17 @@ export default function register(api: OpenClawPluginApi) {
       const token  = (api.config as any)?.channels?.telegram?.botToken;
       if (!token) return;
 
-      const contextWindow = getContextWindow(usage.model, api.config);
+      const modelName = usage.model
+        ?? sessions[sessionKey]?.model
+        ?? sessions[sessionKey]?.modelOverride
+        ?? "claude";
+
+      // Most reliable source: resolved session context chosen by OpenClaw runtime
+      const sessionContext = Number(sessions[sessionKey]?.contextTokens);
+      const contextWindow = Number.isFinite(sessionContext) && sessionContext > 0
+        ? sessionContext
+        : getContextWindow(modelName, api.config);
+
       const pct    = Math.round((usage.totalTokens / contextWindow) * 100);
       const kUsed  = Math.round(usage.totalTokens / 1000);
       const kMax   = Math.round(contextWindow / 1000);

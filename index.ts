@@ -1,13 +1,54 @@
 import { readFileSync, existsSync, openSync, fstatSync, readSync, closeSync } from "fs";
 import { join } from "path";
+import { execSync } from "child_process";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 
-const CONTEXT_DEFAULTS: Record<string, number> = {
-  claude: 200_000,
-  gemini: 1_000_000,
-  minimax: 200_000,
-  "gpt-4": 128_000,
-};
+// --- Model context window map (loaded once at startup) ---
+
+let modelContextMap: Map<string, number> | null = null;
+
+function buildModelContextMap(): Map<string, number> {
+  const map = new Map<string, number>();
+  try {
+    const json = execSync("openclaw models list --json", { timeout: 5000 }).toString("utf8");
+    const data = JSON.parse(json);
+    for (const m of data?.models ?? []) {
+      if (m?.key && m?.contextWindow) {
+        // Index by full key (e.g. "openai-codex/gpt-5.3-codex")
+        map.set(String(m.key).toLowerCase(), Number(m.contextWindow));
+        // Also index by short name after "/" (e.g. "gpt-5.3-codex")
+        const slash = String(m.key).indexOf("/");
+        if (slash >= 0) {
+          map.set(String(m.key).slice(slash + 1).toLowerCase(), Number(m.contextWindow));
+        }
+      }
+    }
+  } catch {
+    // If CLI fails, fall back to sensible defaults
+    map.set("gpt-5.3-codex", 272_000);
+    map.set("claude-sonnet-4-6", 200_000);
+    map.set("claude-sonnet-4-5", 200_000);
+    map.set("minimax-m2.5", 200_000);
+  }
+  return map;
+}
+
+function getContextWindowForModel(model: string): number {
+  if (!modelContextMap) modelContextMap = buildModelContextMap();
+  const low = String(model || "").toLowerCase().trim();
+  // Exact match
+  if (modelContextMap.has(low)) return modelContextMap.get(low)!;
+  // Substring match (handles "MiniMax-M2.5" vs "minimax-m2.5" etc.)
+  for (const [key, val] of modelContextMap) {
+    if (low.includes(key) || key.includes(low)) return val;
+  }
+  // Generic fallbacks
+  if (low.includes("gemini")) return 1_000_000;
+  if (low.includes("minimax")) return 200_000;
+  return 200_000;
+}
+
+// --- JSONL helpers ---
 
 function getStateDir() {
   return process.env.OPENCLAW_STATE_DIR ?? join(process.env.HOME ?? "/root", ".openclaw");
@@ -23,53 +64,7 @@ function readTail(filePath: string, maxBytes = 32_768): string {
   return buf.toString("utf8");
 }
 
-function normalizeModelId(v: string): string {
-  return String(v || "").toLowerCase().trim();
-}
-
-function stripProviderPrefix(v: string): string {
-  const s = normalizeModelId(v);
-  const i = s.indexOf("/");
-  return i >= 0 ? s.slice(i + 1) : s;
-}
-
-function getContextWindow(model: string, cfg: any): number {
-  try {
-    const modelFull = normalizeModelId(model);
-    const modelBase = stripProviderPrefix(model);
-
-    for (const p of Object.values((cfg?.models?.providers ?? {}) as any)) {
-      for (const m of (p as any)?.models ?? []) {
-        if (!m?.id || !m?.contextWindow) continue;
-
-        const idFull = normalizeModelId(m.id);
-        const idBase = stripProviderPrefix(m.id);
-
-        // Support both forms:
-        // - runtime: "gpt-5.3-codex"
-        // - config : "openai-codex/gpt-5.3-codex"
-        if (
-          modelFull === idFull ||
-          modelBase === idBase ||
-          modelFull.includes(idFull) ||
-          idFull.includes(modelFull) ||
-          modelBase.includes(idBase) ||
-          idBase.includes(modelBase)
-        ) {
-          return m.contextWindow;
-        }
-      }
-    }
-  } catch {}
-
-  const low = normalizeModelId(model);
-  for (const [k, v] of Object.entries(CONTEXT_DEFAULTS)) {
-    if (low.includes(k)) return v;
-  }
-  return 200_000;
-}
-
-function getUsage(sessionId: string) {
+function getUsage(sessionId: string): { totalTokens: number; model: string } | null {
   try {
     const f = join(getStateDir(), `agents/main/sessions/${sessionId}.jsonl`);
     if (!existsSync(f)) return null;
@@ -79,7 +74,11 @@ function getUsage(sessionId: string) {
       try {
         const e = JSON.parse(line);
         if (e?.message?.role === "assistant" && e.message.usage?.totalTokens) {
-          return { totalTokens: e.message.usage.totalTokens, model: e.message.model as string | undefined };
+          // model here is always the actual model used for this run
+          return {
+            totalTokens: e.message.usage.totalTokens,
+            model: e.message.model ?? "",
+          };
         }
       } catch {}
     }
@@ -87,50 +86,53 @@ function getUsage(sessionId: string) {
   return null;
 }
 
+// --- Plugin ---
+
 export default function register(api: OpenClawPluginApi) {
+  // Pre-build map at startup so first message has no delay
+  modelContextMap = buildModelContextMap();
+  console.log("[context-meter] model map loaded, entries=" + modelContextMap.size);
+
   api.on("agent_end", async (_evt: any, ctx: any) => {
     try {
-      // Skip if the response was interrupted/cancelled by the user
       if (_evt?.success === false) return;
 
       const sessionKey = ctx?.sessionKey as string | undefined;
       const sessionId  = ctx?.sessionId  as string | undefined;
       if (!sessionKey || !sessionId) return;
 
+      // Get usage from JSONL — this has the REAL model that ran (not sessions.json which
+      // may have been updated mid-run by a /models command)
       const usage = getUsage(sessionId);
       if (!usage) return;
 
+      // Resolve context window from actual run model
+      const contextWindow = getContextWindowForModel(usage.model);
+
+      console.log(`[context-meter] sessionId=${sessionId} model=${usage.model} contextWindow=${contextWindow}`);
+
+      // Get chat destination from sessions.json
       const stateDir = getStateDir();
       const sessionsFile = join(stateDir, "agents/main/sessions/sessions.json");
       if (!existsSync(sessionsFile)) return;
 
       const sessions: Record<string, any> = JSON.parse(readFileSync(sessionsFile, "utf8"));
-      const origin = sessions[sessionKey]?.origin;
+      const session = sessions[sessionKey]
+        ?? Object.values(sessions).find((s: any) => s?.sessionId === sessionId);
+      if (!session) return;
+
+      const origin = session.origin;
       if (origin?.provider !== "telegram") return;
 
-      // origin.to is always "telegram:<chatId>" (works for both direct and group chats)
-      // origin.from for groups is "telegram:group:-5170072400" — wrong format for API
       const chatId = (origin.to as string)?.replace("telegram:", "");
       const token  = (api.config as any)?.channels?.telegram?.botToken;
       if (!token) return;
 
-      const modelName = usage.model
-        ?? sessions[sessionKey]?.model
-        ?? sessions[sessionKey]?.modelOverride
-        ?? "claude";
-
-      // Most reliable source: resolved session context chosen by OpenClaw runtime
-      const sessionContext = Number(sessions[sessionKey]?.contextTokens);
-      const contextWindow = Number.isFinite(sessionContext) && sessionContext > 0
-        ? sessionContext
-        : getContextWindow(modelName, api.config);
-
-      const pct    = Math.round((usage.totalTokens / contextWindow) * 100);
-      const kUsed  = Math.round(usage.totalTokens / 1000);
-      const kMax   = Math.round(contextWindow / 1000);
+      const pct   = Math.round((usage.totalTokens / contextWindow) * 100);
+      const kUsed = Math.round(usage.totalTokens / 1000);
+      const kMax  = Math.round(contextWindow / 1000);
       const footer = `📊 ${kUsed}k / ${kMax}k (${pct}%)`;
 
-      // Small delay so block streaming finishes before we send
       await new Promise(r => setTimeout(r, 2000));
 
       await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {

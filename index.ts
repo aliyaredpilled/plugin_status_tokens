@@ -171,7 +171,99 @@ export default function register(api: OpenClawPluginApi) {
     } catch {}
   });
 
-  // 2) message_sent: debounce — reset timer on each sent message,
+  // 2) before_compaction: notify user + save pre-compaction tokens
+  const preCompactionTokens = new Map<string, number>();
+
+  api.on("before_compaction", async (_evt: any, ctx: any) => {
+    try {
+      const sessionKey = ctx?.sessionKey as string | undefined;
+      const sessionId  = ctx?.sessionId  as string | undefined;
+      if (!sessionKey || !sessionId) return;
+
+      // Save pre-compaction token count
+      const usage = getUsage(sessionId);
+      if (usage) preCompactionTokens.set(sessionId, usage.totalTokens);
+
+      const stateDir = getStateDir();
+      const sessionsFile = join(stateDir, "agents/main/sessions/sessions.json");
+      if (!existsSync(sessionsFile)) return;
+
+      const sessions: Record<string, any> = JSON.parse(readFileSync(sessionsFile, "utf8"));
+      const session = sessions[sessionKey]
+        ?? Object.values(sessions).find((s: any) => s?.sessionId === sessionId);
+      if (!session) return;
+
+      const origin = session.origin;
+      if (origin?.provider !== "telegram") return;
+
+      const chatId = normalizeChatId(origin.to as string);
+      const token  = (api.config as any)?.channels?.telegram?.botToken;
+      if (!chatId || !token) return;
+
+      const text = `🧹 Сжимаю контекст… подождите пожалуйста несколько минут`;
+
+      console.log(`[context-meter] before_compaction: chat=${chatId}`);
+
+      await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: chatId, text, disable_notification: true }),
+      });
+    } catch {}
+  });
+
+  api.on("after_compaction", async (_evt: any, ctx: any) => {
+    try {
+      const sessionKey = ctx?.sessionKey as string | undefined;
+      const sessionId  = ctx?.sessionId  as string | undefined;
+      if (!sessionKey || !sessionId) return;
+
+      const stateDir = getStateDir();
+      const sessionsFile = join(stateDir, "agents/main/sessions/sessions.json");
+      if (!existsSync(sessionsFile)) return;
+
+      const sessions: Record<string, any> = JSON.parse(readFileSync(sessionsFile, "utf8"));
+      const session = sessions[sessionKey]
+        ?? Object.values(sessions).find((s: any) => s?.sessionId === sessionId);
+      if (!session) return;
+
+      const origin = session.origin;
+      if (origin?.provider !== "telegram") return;
+
+      const chatId = normalizeChatId(origin.to as string);
+      const token  = (api.config as any)?.channels?.telegram?.botToken;
+      if (!chatId || !token) return;
+
+      const usage = getUsage(sessionId);
+      if (!usage) return;
+
+      const beforeTokens = preCompactionTokens.get(sessionId);
+      preCompactionTokens.delete(sessionId);
+
+      const kAfter = Math.round(usage.totalTokens / 1000);
+      const contextWindow = getContextWindowForModel(usage.model);
+      const kMax = Math.round(contextWindow / 1000);
+      const pct = Math.round((usage.totalTokens / contextWindow) * 100);
+
+      let text: string;
+      if (beforeTokens) {
+        const kBefore = Math.round(beforeTokens / 1000);
+        text = `🧹 Готово! Сжал контекст ${kBefore}k → ${kAfter}k (${pct}% из ${kMax}k)`;
+      } else {
+        text = `🧹 Готово! Контекст сжат до ${kAfter}k / ${kMax}k (${pct}%)`;
+      }
+
+      console.log(`[context-meter] after_compaction: chat=${chatId} ${text}`);
+
+      await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: chatId, text, disable_notification: true }),
+      });
+    } catch {}
+  });
+
+  // 4) message_sent: debounce — reset timer on each sent message,
   //    so footer goes out 1.5s after the LAST message is delivered
   api.on("message_sent", (evt: any, ctx: any) => {
     try {

@@ -1,70 +1,87 @@
-# context-meter — OpenClaw Plugin
+# openclaw-context-meter
 
-Automatically sends a context usage footer after every AI reply in Telegram:
+Automatic context window usage footer for OpenClaw Telegram bots.
+
+After every bot response, sends a small status message showing how much of the model's context window is used:
 
 ```
-📊 62k / 200k (31%)
+📊 45k / 200k (22%)
 ```
 
-## How it works
+When compaction is detected (tokens drop significantly), shows the before/after:
 
-- Hooks into `agent_end` — fires after every LLM response
-- Reads `totalTokens` from the session JSONL file
-- Looks up context window size from config (falls back to known defaults)
-- Sends a silent Telegram message with usage stats ~2 seconds after the reply
+```
+📊 30k / 200k (15%) — сжат с 150k
+```
 
-## Supported models
+## Features
 
-| Model family | Context window (fallback) |
-|---|---|
-| Claude | 200k |
-| Gemini | 1M (Gemini 1.5 Pro is 2M — add to config for exact value) |
-| MiniMax | 200k (or from config) |
-| GPT-4 / GPT-4o | 128k |
+- Zero-cost: uses `agent_end` + `message_sent` hooks only, no extra API calls
+- No subprocesses: model context windows are hardcoded (no `execSync` OOM risk)
+- Smart filtering: skips tool_use turns, only sends footer after final text response
+- Debounced: waits 1.5s after last message to avoid footer mid-stream
+- Multi-agent: works with multiple agents and Telegram accounts
+- Compaction detection: detects token drops and shows before/after stats
 
-Custom models: add `contextWindow` to your provider config in `openclaw.json` and it will be picked up automatically.
+## Install
 
-## Installation
-
-> Full install guide with all options: [INSTALL.md](INSTALL.md)
-
-**1. Copy files:**
+Copy to your OpenClaw extensions directory:
 
 ```bash
 mkdir -p ~/.openclaw/extensions/context-meter
-cd ~/.openclaw/extensions/context-meter
-curl -O https://raw.githubusercontent.com/aliyaredpilled/plugin_status_tokens/main/index.ts
-curl -O https://raw.githubusercontent.com/aliyaredpilled/plugin_status_tokens/main/openclaw.plugin.json
+cp index.ts openclaw.plugin.json ~/.openclaw/extensions/context-meter/
 ```
 
-**2. Register in `openclaw.json`:**
+Add to `~/.openclaw/openclaw.json`:
 
 ```json
 {
   "plugins": {
+    "allow": ["context-meter"],
     "entries": {
-      "context-meter": {
-        "path": "~/.openclaw/extensions/context-meter"
-      }
+      "context-meter": { "enabled": true }
     }
   }
 }
 ```
 
-**3. Restart:**
+Restart gateway:
 
 ```bash
-openclaw gateway restart
+systemctl --user restart openclaw-gateway
 ```
+
+## Supported models
+
+| Model | Context Window |
+|-------|---------------|
+| gpt-5.4 / gpt-5.4-mini / gpt-5.4-nano | 272k |
+| gpt-5.3-codex | 272k |
+| claude-sonnet-4-6 / claude-sonnet-4-5 | 200k |
+| claude-haiku-4-5 / claude-opus-4-6 | 200k |
+| minimax-m2.5 / minimax-m2.7 | 200k |
+| glm-5 | 205k |
+| gemini | 1M |
+
+Unknown models default to 200k. To add a model, edit `MODEL_CONTEXT_WINDOWS` in `index.ts`.
 
 ## Requirements
 
-- OpenClaw with Telegram channel configured
-- Plugin runs on `agent_end` hook — works with block streaming enabled
+- OpenClaw >= 2026.3.13 (for `agent_end` ctx with `sessionId` + `sessionKey`)
+- Telegram channel enabled
 
-## Why a separate message (not inside the reply)?
+## How it works
 
-With block streaming, Telegram receives the reply via `editMessage`. The internal `message:sent` hook doesn't fire for streaming messages (`sessionKeyForInternalHooks = params.mirror?.sessionKey` — `mirror` is not set during streaming), so the `messageId` of the final message is not accessible from plugins. A follow-up `sendMessage` after a 2-second delay is the reliable solution.
+1. `agent_end` hook fires after each bot response — plugin checks if it was a text response (not tool_use) and finds the Telegram chat ID from the session
+2. `message_sent` hook fires for each Telegram message delivery — plugin debounces with 1.5s timer
+3. After the last message is delivered, reads the session JSONL file tail to get current token count
+4. Calculates percentage of model's context window and sends the footer via Telegram Bot API
+
+## v2.0 vs v1.0
+
+v1.0 used `execSync("openclaw models list --json")` to dynamically discover model context windows. This spawned a full OpenClaw process (~2GB RAM) on every plugin load, causing OOM on servers with limited memory.
+
+v2.0 hardcodes model context windows — zero memory overhead, zero subprocesses.
 
 ## License
 

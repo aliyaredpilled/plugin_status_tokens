@@ -1,47 +1,30 @@
 import { readFileSync, existsSync, openSync, fstatSync, readSync, closeSync } from "fs";
 import { join } from "path";
-import { execSync } from "child_process";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 
-// --- Model context window map (loaded once at startup) ---
+// --- Model context window map (hardcoded, no subprocess!) ---
 
-let modelContextMap: Map<string, number> | null = null;
-
-function buildModelContextMap(): Map<string, number> {
-  const map = new Map<string, number>();
-  try {
-    const json = execSync("openclaw models list --json", { timeout: 5000 }).toString("utf8");
-    const data = JSON.parse(json);
-    for (const m of data?.models ?? []) {
-      if (m?.key && m?.contextWindow) {
-        map.set(String(m.key).toLowerCase(), Number(m.contextWindow));
-        const slash = String(m.key).indexOf("/");
-        if (slash >= 0) {
-          const shortKey = String(m.key).slice(slash + 1).toLowerCase();
-          if (!map.has(shortKey)) {
-            map.set(shortKey, Number(m.contextWindow));
-          }
-        }
-      }
-    }
-  } catch {
-    map.set("gpt-5.3-codex", 272_000);
-    map.set("claude-sonnet-4-6", 200_000);
-    map.set("claude-sonnet-4-5", 200_000);
-    map.set("minimax-m2.5", 200_000);
-  }
-  return map;
-}
+const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
+  "gpt-5.4": 272_000,
+  "gpt-5.4-mini": 272_000,
+  "gpt-5.4-nano": 272_000,
+  "gpt-5.3-codex": 272_000,
+  "claude-sonnet-4-6": 200_000,
+  "claude-sonnet-4-5": 200_000,
+  "claude-haiku-4-5": 200_000,
+  "claude-opus-4-6": 200_000,
+  "minimax-m2.5": 200_000,
+  "minimax-m2.7": 200_000,
+  "glm-5": 204_800,
+  "gemini": 1_000_000,
+};
 
 function getContextWindowForModel(model: string): number {
-  if (!modelContextMap) modelContextMap = buildModelContextMap();
   const low = String(model || "").toLowerCase().trim();
-  if (modelContextMap.has(low)) return modelContextMap.get(low)!;
-  for (const [key, val] of modelContextMap) {
+  if (MODEL_CONTEXT_WINDOWS[low]) return MODEL_CONTEXT_WINDOWS[low];
+  for (const [key, val] of Object.entries(MODEL_CONTEXT_WINDOWS)) {
     if (low.includes(key) || key.includes(low)) return val;
   }
-  if (low.includes("gemini")) return 1_000_000;
-  if (low.includes("minimax")) return 200_000;
   return 200_000;
 }
 
@@ -61,9 +44,9 @@ function readTail(filePath: string, maxBytes = 32_768): string {
   return buf.toString("utf8");
 }
 
-function getUsage(sessionId: string): { totalTokens: number; model: string } | null {
+function getUsage(sessionId: string, agentId: string = "main"): { totalTokens: number; model: string } | null {
   try {
-    const f = join(getStateDir(), `agents/main/sessions/${sessionId}.jsonl`);
+    const f = join(getStateDir(), `agents/${agentId}/sessions/${sessionId}.jsonl`);
     if (!existsSync(f)) return null;
     const lines = readTail(f).split("\n").reverse();
     for (const line of lines) {
@@ -71,10 +54,7 @@ function getUsage(sessionId: string): { totalTokens: number; model: string } | n
       try {
         const e = JSON.parse(line);
         if (e?.message?.role === "assistant" && e.message.usage?.totalTokens) {
-          return {
-            totalTokens: e.message.usage.totalTokens,
-            model: e.message.model ?? "",
-          };
+          return { totalTokens: e.message.usage.totalTokens, model: e.message.model ?? "" };
         }
       } catch {}
     }
@@ -82,19 +62,40 @@ function getUsage(sessionId: string): { totalTokens: number; model: string } | n
   return null;
 }
 
-// --- Pending footer: debounce via message_sent ---
+// --- Pending footer state ---
 
 type PendingFooter = {
   chatId: string;
   token: string;
   sessionId: string;
+  agentId: string;
   timer: ReturnType<typeof setTimeout> | null;
 };
 
 const pendingByChat = new Map<string, PendingFooter>();
+const lastTokensByChat = new Map<string, number>();
 
 function normalizeChatId(to: string): string {
   return String(to ?? "").replace("telegram:", "");
+}
+
+function getBotToken(api: OpenClawPluginApi, agentId: string): string | undefined {
+  const tg = (api.config as any)?.channels?.telegram;
+  if (!tg) return undefined;
+  if (tg.accounts) {
+    const bindings = (api.config as any)?.bindings ?? [];
+    for (const b of bindings) {
+      if (b.agentId === agentId && b.match?.channel === "telegram" && b.match?.accountId) {
+        const acct = tg.accounts[b.match.accountId];
+        if (acct?.botToken) return acct.botToken;
+      }
+    }
+    if (tg.accounts.default?.botToken) return tg.accounts.default.botToken;
+    for (const acct of Object.values(tg.accounts)) {
+      if ((acct as any)?.botToken) return (acct as any).botToken;
+    }
+  }
+  return tg.botToken;
 }
 
 async function flushFooter(chatId: string) {
@@ -103,16 +104,27 @@ async function flushFooter(chatId: string) {
   pendingByChat.delete(chatId);
 
   try {
-    const usage = getUsage(entry.sessionId);
+    const usage = getUsage(entry.sessionId, entry.agentId);
     if (!usage) return;
 
     const contextWindow = getContextWindowForModel(usage.model);
-    const pct   = Math.round((usage.totalTokens / contextWindow) * 100);
+    const pct = Math.round((usage.totalTokens / contextWindow) * 100);
     const kUsed = Math.round(usage.totalTokens / 1000);
-    const kMax  = Math.round(contextWindow / 1000);
-    const footer = `📊 ${kUsed}k / ${kMax}k (${pct}%)`;
+    const kMax = Math.round(contextWindow / 1000);
 
-    console.log(`[context-meter] sending footer for chat=${chatId}: ${footer}`);
+    // Detect compaction: tokens dropped significantly
+    const prevTokens = lastTokensByChat.get(chatId);
+    lastTokensByChat.set(chatId, usage.totalTokens);
+
+    let footer: string;
+    if (prevTokens && prevTokens > usage.totalTokens * 1.3) {
+      const kBefore = Math.round(prevTokens / 1000);
+      footer = `\u{1F4CA} ${kUsed}k / ${kMax}k (${pct}%) \u{2014} \u{0441}\u{0436}\u{0430}\u{0442} \u{0441} ${kBefore}k`;
+    } else {
+      footer = `\u{1F4CA} ${kUsed}k / ${kMax}k (${pct}%)`;
+    }
+
+    console.log(`[context-meter-lite] footer chat=${chatId}: ${footer}`);
 
     await fetch(`https://api.telegram.org/bot${entry.token}/sendMessage`, {
       method: "POST",
@@ -125,24 +137,34 @@ async function flushFooter(chatId: string) {
 // --- Plugin ---
 
 export default function register(api: OpenClawPluginApi) {
-  modelContextMap = buildModelContextMap();
-  console.log("[context-meter] model map loaded, entries=" + modelContextMap.size);
+  console.log("[context-meter-lite] loaded (no subprocess)");
 
-  // 1) agent_end: mark that this chat needs a footer
+  // 1) agent_end: mark chat for footer
   api.on("agent_end", async (_evt: any, ctx: any) => {
     try {
-      if (_evt?.success === false) return;
+      if (!_evt?.success || _evt?.error) return;
 
+      // Skip tool_use turns
+      const msgs = _evt?.messages ?? [];
+      const lastAssistant = [...msgs].reverse().find((m: any) => m.role === "assistant");
+      const lastContent = lastAssistant?.content;
+      const hasTextBlock = Array.isArray(lastContent)
+        ? lastContent.some((b: any) => b.type === "text" && b.text?.trim())
+        : typeof lastContent === "string" && lastContent.trim().length > 0;
+      if (!hasTextBlock) return;
+
+      const sessionId = ctx?.sessionId as string | undefined;
       const sessionKey = ctx?.sessionKey as string | undefined;
-      const sessionId  = ctx?.sessionId  as string | undefined;
-      if (!sessionKey || !sessionId) return;
+      const agentId = ctx?.agentId as string || "main";
+      if (!sessionId) return;
 
+      // Find telegram chatId from sessions.json
       const stateDir = getStateDir();
-      const sessionsFile = join(stateDir, "agents/main/sessions/sessions.json");
+      const sessionsFile = join(stateDir, `agents/${agentId}/sessions/sessions.json`);
       if (!existsSync(sessionsFile)) return;
 
       const sessions: Record<string, any> = JSON.parse(readFileSync(sessionsFile, "utf8"));
-      const session = sessions[sessionKey]
+      const session = (sessionKey ? sessions[sessionKey] : null)
         ?? Object.values(sessions).find((s: any) => s?.sessionId === sessionId);
       if (!session) return;
 
@@ -150,121 +172,18 @@ export default function register(api: OpenClawPluginApi) {
       if (origin?.provider !== "telegram") return;
 
       const chatId = normalizeChatId(origin.to as string);
-      const token  = (api.config as any)?.channels?.telegram?.botToken;
+      const token = getBotToken(api, agentId);
       if (!chatId || !token) return;
 
-      console.log(`[context-meter] agent_end: pending footer for chat=${chatId}`);
-
-      // Cancel any existing pending footer for this chat
+      // Cancel existing pending
       const existing = pendingByChat.get(chatId);
       if (existing?.timer) clearTimeout(existing.timer);
 
-      // Set pending footer — will be flushed by message_sent debounce
-      // Fallback: flush after 5s if no message_sent arrives
-      const entry: PendingFooter = {
-        chatId,
-        token,
-        sessionId,
-        timer: setTimeout(() => flushFooter(chatId), 5000),
-      };
-      pendingByChat.set(chatId, entry);
+      pendingByChat.set(chatId, { chatId, token, sessionId, agentId, timer: null });
     } catch {}
   });
 
-  // 2) before_compaction: notify user + save pre-compaction tokens
-  const preCompactionTokens = new Map<string, number>();
-
-  api.on("before_compaction", async (_evt: any, ctx: any) => {
-    try {
-      const sessionKey = ctx?.sessionKey as string | undefined;
-      const sessionId  = ctx?.sessionId  as string | undefined;
-      if (!sessionKey || !sessionId) return;
-
-      // Save pre-compaction token count
-      const usage = getUsage(sessionId);
-      if (usage) preCompactionTokens.set(sessionId, usage.totalTokens);
-
-      const stateDir = getStateDir();
-      const sessionsFile = join(stateDir, "agents/main/sessions/sessions.json");
-      if (!existsSync(sessionsFile)) return;
-
-      const sessions: Record<string, any> = JSON.parse(readFileSync(sessionsFile, "utf8"));
-      const session = sessions[sessionKey]
-        ?? Object.values(sessions).find((s: any) => s?.sessionId === sessionId);
-      if (!session) return;
-
-      const origin = session.origin;
-      if (origin?.provider !== "telegram") return;
-
-      const chatId = normalizeChatId(origin.to as string);
-      const token  = (api.config as any)?.channels?.telegram?.botToken;
-      if (!chatId || !token) return;
-
-      const text = `🧹 Сжимаю контекст… подождите пожалуйста несколько минут`;
-
-      console.log(`[context-meter] before_compaction: chat=${chatId}`);
-
-      await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chat_id: chatId, text, disable_notification: true }),
-      });
-    } catch {}
-  });
-
-  api.on("after_compaction", async (_evt: any, ctx: any) => {
-    try {
-      const sessionKey = ctx?.sessionKey as string | undefined;
-      const sessionId  = ctx?.sessionId  as string | undefined;
-      if (!sessionKey || !sessionId) return;
-
-      const stateDir = getStateDir();
-      const sessionsFile = join(stateDir, "agents/main/sessions/sessions.json");
-      if (!existsSync(sessionsFile)) return;
-
-      const sessions: Record<string, any> = JSON.parse(readFileSync(sessionsFile, "utf8"));
-      const session = sessions[sessionKey]
-        ?? Object.values(sessions).find((s: any) => s?.sessionId === sessionId);
-      if (!session) return;
-
-      const origin = session.origin;
-      if (origin?.provider !== "telegram") return;
-
-      const chatId = normalizeChatId(origin.to as string);
-      const token  = (api.config as any)?.channels?.telegram?.botToken;
-      if (!chatId || !token) return;
-
-      const usage = getUsage(sessionId);
-      if (!usage) return;
-
-      const beforeTokens = preCompactionTokens.get(sessionId);
-      preCompactionTokens.delete(sessionId);
-
-      const kAfter = Math.round(usage.totalTokens / 1000);
-      const contextWindow = getContextWindowForModel(usage.model);
-      const kMax = Math.round(contextWindow / 1000);
-      const pct = Math.round((usage.totalTokens / contextWindow) * 100);
-
-      let text: string;
-      if (beforeTokens) {
-        const kBefore = Math.round(beforeTokens / 1000);
-        text = `🧹 Готово! Сжал контекст ${kBefore}k → ${kAfter}k (${pct}% из ${kMax}k)`;
-      } else {
-        text = `🧹 Готово! Контекст сжат до ${kAfter}k / ${kMax}k (${pct}%)`;
-      }
-
-      console.log(`[context-meter] after_compaction: chat=${chatId} ${text}`);
-
-      await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chat_id: chatId, text, disable_notification: true }),
-      });
-    } catch {}
-  });
-
-  // 4) message_sent: debounce — reset timer on each sent message,
-  //    so footer goes out 1.5s after the LAST message is delivered
+  // 2) message_sent: debounce footer after last telegram message
   api.on("message_sent", (evt: any, ctx: any) => {
     try {
       if (ctx?.channelId !== "telegram") return;
@@ -273,7 +192,6 @@ export default function register(api: OpenClawPluginApi) {
       const entry = pendingByChat.get(chatId);
       if (!entry) return;
 
-      // Reset debounce timer
       if (entry.timer) clearTimeout(entry.timer);
       entry.timer = setTimeout(() => flushFooter(chatId), 1500);
     } catch {}

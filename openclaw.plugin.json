@@ -1,11 +1,14 @@
 {
   "id": "context-meter",
   "name": "Context Meter",
-  "description": "Appends 📊 Xk/200k (Y%) context usage footer to every outbound AI reply",
-  "version": "1.0.0",
+  "version": "2.0.0",
+  "description": "Shows context window usage percentage after each bot response in Telegram",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
     "properties": {}
+  },
+  "openclaw": {
+    "extensions": ["./index.ts"]
   }
 }

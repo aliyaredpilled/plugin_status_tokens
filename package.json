@@ -1,0 +1,24 @@
+{
+  "name": "openclaw-context-meter",
+  "version": "2.2.0",
+  "description": "Automatic context window usage footer for OpenClaw Telegram bots",
+  "main": "index.ts",
+  "keywords": [
+    "openclaw",
+    "plugin",
+    "telegram",
+    "context",
+    "tokens",
+    "usage",
+    "meter"
+  ],
+  "author": "aliyaredpilled",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aliyaredpilled/plugin_status_tokens"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.3.13"
+  }
+}

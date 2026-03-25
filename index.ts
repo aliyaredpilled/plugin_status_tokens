@@ -151,8 +151,9 @@ async function flushFooter(chatId: string) {
     const kMax = Math.round(contextWindow / 1000);
 
     // Detect compaction: tokens dropped significantly
-    const prevTokens = lastTokensByChat.get(chatId);
-    lastTokensByChat.set(chatId, usage.totalTokens);
+    const tokenKey = `${entry.agentId}:${chatId}`;
+    const prevTokens = lastTokensByChat.get(tokenKey);
+    lastTokensByChat.set(tokenKey, usage.totalTokens);
 
     let footer: string;
     if (prevTokens && prevTokens > usage.totalTokens * 1.3) {
